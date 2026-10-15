@@ -68,16 +68,26 @@ function pickRounds(tier, n) {
   const r = []; while (r.length < n) { if (!pool.length) for (let i = a; i <= b; i++) pool.push(i); r.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]); }
   return r;
 }
+const GO_MS = 3200, GRACE_MS = 1500;
+function elArr(R) { return R.solves ? R.solves.map(s => s ? s.el : null) : [null, null]; }
+function decideRound(R) {
+  if (R.solvedThis || R.over) return;
+  clearTimeout(R.pendT);
+  const s = R.solves; let w;
+  if (s[0] && s[1]) w = s[0].el !== s[1].el ? (s[0].el < s[1].el ? 0 : 1) : (s[0].at <= s[1].at ? 0 : 1);
+  else w = s[0] ? 0 : 1;
+  finishRound(R, w);
+}
 function finishRound(R, winner) {
-  clearTimeout(R.rtimer); R.solvedThis = true;
+  clearTimeout(R.rtimer); clearTimeout(R.pendT); R.pendT = null; R.solvedThis = true;
   if (winner >= 0) R.scores[winner]++;
   const last = R.r >= R.rounds.length - 1;
   if (last) {
     R.over = true;
     const w = R.scores[0] === R.scores[1] ? -1 : (R.scores[0] > R.scores[1] ? 0 : 1);
-    R.players.forEach(p => send(p, { t: 'matchEnd', roundWinner: winner, winner: w, scores: R.scores, r: R.r }));
+    R.players.forEach(p => send(p, { t: 'matchEnd', roundWinner: winner, winner: w, scores: R.scores, r: R.r, el: elArr(R) }));
   } else {
-    R.players.forEach(p => send(p, { t: 'roundEnd', winner, scores: R.scores, r: R.r }));
+    R.players.forEach(p => send(p, { t: 'roundEnd', winner, scores: R.scores, r: R.r, el: elArr(R) }));
     R.timer = setTimeout(() => { R.r++; startRound(R); }, 3500);
   }
 }
@@ -90,7 +100,7 @@ function cancelInvite(c, why) {
 function leave(c) {
   cancelInvite(c, 'gone');
   const R = c.room; if (!R) return; c.room = null;
-  clearTimeout(R.timer); clearTimeout(R.rtimer);
+  clearTimeout(R.timer); clearTimeout(R.rtimer); clearTimeout(R.pendT);
   const o = R.players[1 - c.idx];
   if (o && !o.dead && !R.over) send(o, { t: 'oppLeft' });
   if (o && o.room === R) { o.room = null; o.avail = false; }
@@ -98,14 +108,15 @@ function leave(c) {
   if (lobby.has(c) || (o && lobby.has(o))) setTimeout(broadcastLobby, 0);
 }
 function startRound(R) {
-  R.solvedThis = false; R.moves = [0, 0];
+  R.solvedThis = false; R.moves = [0, 0]; R.solves = [null, null]; R.goAt = Date.now() + GO_MS; clearTimeout(R.pendT); R.pendT = null;
   const limit = LIMITS[Math.max(0, Math.min(2, R.tier))];
   R.players.forEach(p => send(p, { t: 'round', r: R.r, total: R.rounds.length, level: R.rounds[R.r], scores: R.scores, limit, countdown: 3 }));
   clearTimeout(R.rtimer);
-  R.rtimer = setTimeout(() => { if (!R.solvedThis && !R.over) finishRound(R, -1); }, (3 + limit) * 1000 + 500);
+  R.limitMs = limit * 1000;
+  R.rtimer = setTimeout(() => { if (R.solvedThis || R.over) return; if (R.solves[0] || R.solves[1]) decideRound(R); else finishRound(R, -1); }, GO_MS + limit * 1000 + 2000);
 }
 function onMsg(c, m) {
-  if (m.t === 'ping') return send(c, { t: 'pong' });
+  if (m.t === 'ping') return send(c, { t: 'pong', c: m.c });
   if (m.t === 'lobby') {
     leave(c);
     c.name = cleanName(m.name, c); c.id = c.id || nextId++; c.avail = !!m.avail; lobby.add(c);
@@ -162,6 +173,15 @@ function onMsg(c, m) {
   const R = c.room; if (!R || R.players.length < 2 || R.over) return;
   if (m.t === 'state') { const o = R.players[1 - c.idx]; return send(o, { t: 'opp', moves: m.n | 0, p: Array.isArray(m.p) ? m.p.slice(0, 16).map(v => v | 0) : null }); }
   if (m.t === 'moves') { const o = R.players[1 - c.idx]; return send(o, { t: 'opp', moves: m.n | 0 }); }
-  if (m.t === 'solved' && !R.solvedThis) finishRound(R, c.idx);
+  if (m.t === 'solved' && !R.solvedThis && !R.solves[c.idx]) {
+    const now = Date.now(), srvEl = Math.max(0, now - R.goAt);
+    // client-measured time since its own GO; bounded by what the server saw so it cannot be far off (old clients send none: use arrival time)
+    let el = Number.isFinite(+m.el) && m.el !== undefined ? Math.round(+m.el) : srvEl;
+    el = Math.max(srvEl - 3000, Math.min(srvEl + 300, el)); el = Math.max(0, el);
+    if (el > R.limitMs + 300) return;
+    R.solves[c.idx] = { el, at: now };
+    if (R.solves[0] && R.solves[1]) return decideRound(R);
+    if (!R.pendT) R.pendT = setTimeout(() => decideRound(R), GRACE_MS);
+  }
 }
 server.listen(PORT, () => console.log('Wood Slide server listening on port ' + PORT));
