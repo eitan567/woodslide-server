@@ -5,6 +5,19 @@ const PORT = process.env.PORT || 8080;
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const TIERS = [[0, 19], [20, 39], [40, 59]];
 const rooms = new Map();
+const lobby = new Set(); let nextId = 1;
+function cleanName(n, c) {
+  n = String(n || '').replace(/[\u0000-\u001f\u007f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 16);
+  if (!n) n = 'Player';
+  const used = new Set([...lobby].filter(o => o !== c).map(o => o.name));
+  let out = n, k = 2; while (used.has(out)) out = n.slice(0, 13) + ' ' + (k++);
+  return out;
+}
+function status(c) { return c.room && !c.room.over ? 'busy' : (c.avail ? 'avail' : 'idle'); }
+function broadcastLobby() {
+  const players = [...lobby].filter(c => !c.dead).slice(0, 60).map(c => ({ id: c.id, name: c.name, s: status(c) }));
+  lobby.forEach(c => send(c, { t: 'lobby', you: c.id, players }));
+}
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'text/plain' });
@@ -43,7 +56,7 @@ server.on('upgrade', (req, socket) => {
       if (op === 1) { let m; try { m = JSON.parse(payload.toString()); } catch (e) { continue; } onMsg(c, m); }
     }
   });
-  const close = () => { if (c.dead) return; c.dead = true; leave(c); };
+  const close = () => { if (c.dead) return; c.dead = true; leave(c); if (lobby.delete(c)) broadcastLobby(); };
   socket.on('close', close); socket.on('error', close);
 });
 
@@ -72,8 +85,10 @@ function leave(c) {
   const R = c.room; if (!R) return; c.room = null;
   clearTimeout(R.timer); clearTimeout(R.rtimer);
   const o = R.players[1 - c.idx];
-  if (o && !o.dead) send(o, { t: 'oppLeft' });
+  if (o && !o.dead && !R.over) send(o, { t: 'oppLeft' });
+  if (o && o.room === R) { o.room = null; o.avail = false; }
   rooms.delete(R.code);
+  if (lobby.has(c) || (o && lobby.has(o))) setTimeout(broadcastLobby, 0);
 }
 function startRound(R) {
   R.solvedThis = false; R.moves = [0, 0];
@@ -84,6 +99,28 @@ function startRound(R) {
 }
 function onMsg(c, m) {
   if (m.t === 'ping') return send(c, { t: 'pong' });
+  if (m.t === 'lobby') {
+    leave(c);
+    c.name = cleanName(m.name, c); c.id = c.id || nextId++; c.avail = false; lobby.add(c);
+    broadcastLobby(); return;
+  }
+  if (m.t === 'avail') {
+    if (!lobby.has(c) || (c.room && !c.room.over)) return;
+    c.avail = !!m.on; broadcastLobby(); return;
+  }
+  if (m.t === 'pick') {
+    if (!lobby.has(c) || (c.room && !c.room.over)) return send(c, { t: 'err', e: 'taken' });
+    const o = [...lobby].find(x => x.id === (m.id | 0));
+    if (!o || o === c || o.dead || !o.avail || (o.room && !o.room.over)) { send(c, { t: 'err', e: 'taken' }); return broadcastLobby(); }
+    leave(c); leave(o);
+    const code = newCode();
+    const R = { code, players: [o, c], tier: m.tier | 0, n: [5, 10, 15, 20].includes(m.rounds | 0) ? m.rounds | 0 : 5, rounds: [], r: 0, scores: [0, 0], solvedThis: false, moves: [0, 0], over: false };
+    rooms.set(code, R); o.room = R; o.idx = 0; c.room = R; c.idx = 1; o.avail = false; c.avail = false;
+    R.rounds = pickRounds(R.tier, R.n);
+    R.players.forEach((p, i) => send(p, { t: 'start', you: i, tier: R.tier, n: R.n, opp: R.players[1 - i].name }));
+    broadcastLobby();
+    return setTimeout(() => startRound(R), 800);
+  }
   if (m.t === 'create') {
     leave(c);
     const code = newCode();
