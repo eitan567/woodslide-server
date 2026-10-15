@@ -5,7 +5,7 @@ const PORT = process.env.PORT || 8080;
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const TIERS = [[0, 19], [20, 39], [40, 59]];
 const rooms = new Map();
-const lobby = new Set(); let nextId = 1;
+const lobby = new Set(); let nextId = 1; const wsAll = new Set();
 function cleanName(n, c) {
   n = String(n || '').replace(/[\u0000-\u001f\u007f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 16);
   if (!n) n = 'Player';
@@ -56,7 +56,8 @@ server.on('upgrade', (req, socket) => {
       if (op === 1) { let m; try { m = JSON.parse(payload.toString()); } catch (e) { continue; } onMsg(c, m); }
     }
   });
-  const close = () => { if (c.dead) return; c.dead = true; leave(c); if (lobby.delete(c)) broadcastLobby(); };
+  wsAll.add(c);
+  const close = () => { wsAll.delete(c); if (c.dead) return; c.dead = true; leave(c); if (lobby.delete(c)) broadcastLobby(); };
   socket.on('close', close); socket.on('error', close);
 });
 
@@ -120,6 +121,12 @@ function onMsg(c, m) {
   if (m.t === 'ping') { if (Number.isFinite(+m.r)) c.rtt = Math.max(0, Math.min(5000, +m.r)); return send(c, { t: 'pong', c: m.c }); }
   if (m.t === 'lobby') {
     leave(c);
+    // same device reconnecting (reload / killed app): drop its own older socket right away so no ghost stays listed.
+    // cid is a random per-install id, never broadcast; only an older socket with the identical cid is removed.
+    if (typeof m.cid === 'string' && /^[0-9a-f]{16,64}$/.test(m.cid)) {
+      c.cid = m.cid;
+      [...wsAll].forEach(o => { if (o !== c && o.cid === c.cid && !o.dead) { o.dead = true; leave(o); lobby.delete(o); try { o.socket.destroy(); } catch (e) {} } });
+    }
     c.name = cleanName(m.name, c); c.id = c.id || nextId++; c.avail = !!m.avail; lobby.add(c);
     broadcastLobby(); return;
   }
