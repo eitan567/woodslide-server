@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: wood-slide-server
+    runtime: node
+    plan: free
+    buildCommand: "echo no build"
+    startCommand: node server.js
