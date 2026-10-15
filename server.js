@@ -13,7 +13,7 @@ function cleanName(n, c) {
   let out = n, k = 2; while (used.has(out)) out = n.slice(0, 13) + ' ' + (k++);
   return out;
 }
-function status(c) { return c.room && !c.room.over ? 'busy' : (c.avail ? 'avail' : 'idle'); }
+function status(c) { return (c.room && !c.room.over) || c.inv ? 'busy' : (c.avail ? 'avail' : 'idle'); }
 function broadcastLobby() {
   const players = [...lobby].filter(c => !c.dead).slice(0, 60).map(c => ({ id: c.id, name: c.name, s: status(c) }));
   lobby.forEach(c => send(c, { t: 'lobby', you: c.id, players }));
@@ -81,7 +81,14 @@ function finishRound(R, winner) {
     R.timer = setTimeout(() => { R.r++; startRound(R); }, 3500);
   }
 }
+function cancelInvite(c, why) {
+  const v = c.inv; if (!v) return;
+  clearTimeout(v.timer); v.from.inv = null; v.to.inv = null;
+  if (why) { send(v.from, { t: 'declined', why }); send(v.to, { t: 'inviteGone' }); }
+  setTimeout(broadcastLobby, 0);
+}
 function leave(c) {
+  cancelInvite(c, 'gone');
   const R = c.room; if (!R) return; c.room = null;
   clearTimeout(R.timer); clearTimeout(R.rtimer);
   const o = R.players[1 - c.idx];
@@ -101,7 +108,7 @@ function onMsg(c, m) {
   if (m.t === 'ping') return send(c, { t: 'pong' });
   if (m.t === 'lobby') {
     leave(c);
-    c.name = cleanName(m.name, c); c.id = c.id || nextId++; c.avail = false; lobby.add(c);
+    c.name = cleanName(m.name, c); c.id = c.id || nextId++; c.avail = !!m.avail; lobby.add(c);
     broadcastLobby(); return;
   }
   if (m.t === 'avail') {
@@ -109,15 +116,29 @@ function onMsg(c, m) {
     c.avail = !!m.on; broadcastLobby(); return;
   }
   if (m.t === 'pick') {
-    if (!lobby.has(c) || (c.room && !c.room.over)) return send(c, { t: 'err', e: 'taken' });
+    if (!lobby.has(c) || (c.room && !c.room.over) || c.inv) return send(c, { t: 'err', e: 'taken' });
     const o = [...lobby].find(x => x.id === (m.id | 0));
-    if (!o || o === c || o.dead || !o.avail || (o.room && !o.room.over)) { send(c, { t: 'err', e: 'taken' }); return broadcastLobby(); }
-    leave(c); leave(o);
+    if (!o || o === c || o.dead || !o.avail || o.inv || (o.room && !o.room.over)) { send(c, { t: 'err', e: 'taken' }); return broadcastLobby(); }
+    c.avail = true; // picking an opponent makes the picker available automatically
+    const v = { from: c, to: o, tier: m.tier | 0, n: [5, 10, 15, 20].includes(m.rounds | 0) ? m.rounds | 0 : 5 };
+    v.timer = setTimeout(() => cancelInvite(v.from, 'timeout'), 25000);
+    c.inv = v; o.inv = v;
+    send(o, { t: 'invite', id: c.id, name: c.name, tier: v.tier, n: v.n });
+    send(c, { t: 'inviting', name: o.name });
+    return broadcastLobby();
+  }
+  if (m.t === 'decline') { if (c.inv && c.inv.to === c) cancelInvite(c, 'declined'); return; }
+  if (m.t === 'cancel') { if (c.inv && c.inv.from === c) cancelInvite(c, 'cancel'); return; }
+  if (m.t === 'accept') {
+    const v = c.inv; if (!v || v.to !== c || v.from.dead) return;
+    clearTimeout(v.timer); v.from.inv = null; v.to.inv = null;
+    const o = c, p = v.from;
+    leave(p); leave(o);
     const code = newCode();
-    const R = { code, players: [o, c], tier: m.tier | 0, n: [5, 10, 15, 20].includes(m.rounds | 0) ? m.rounds | 0 : 5, rounds: [], r: 0, scores: [0, 0], solvedThis: false, moves: [0, 0], over: false };
-    rooms.set(code, R); o.room = R; o.idx = 0; c.room = R; c.idx = 1; o.avail = false; c.avail = false;
+    const R = { code, players: [o, p], tier: v.tier, n: v.n, rounds: [], r: 0, scores: [0, 0], solvedThis: false, moves: [0, 0], over: false };
+    rooms.set(code, R); o.room = R; o.idx = 0; p.room = R; p.idx = 1; o.avail = false; p.avail = false;
     R.rounds = pickRounds(R.tier, R.n);
-    R.players.forEach((p, i) => send(p, { t: 'start', you: i, tier: R.tier, n: R.n, opp: R.players[1 - i].name }));
+    R.players.forEach((q, i) => send(q, { t: 'start', you: i, tier: R.tier, n: R.n, opp: R.players[1 - i].name }));
     broadcastLobby();
     return setTimeout(() => startRound(R), 800);
   }
