@@ -74,7 +74,8 @@ function decideRound(R) {
   if (R.solvedThis || R.over) return;
   clearTimeout(R.pendT);
   const s = R.solves; let w;
-  if (s[0] && s[1]) w = s[0].el !== s[1].el ? (s[0].el < s[1].el ? 0 : 1) : (s[0].at <= s[1].at ? 0 : 1);
+  R.tie = false;
+  if (s[0] && s[1]) { if (s[0].el === s[1].el) { R.tie = true; w = -1; } else w = s[0].el < s[1].el ? 0 : 1; }
   else w = s[0] ? 0 : 1;
   finishRound(R, w);
 }
@@ -85,9 +86,9 @@ function finishRound(R, winner) {
   if (last) {
     R.over = true;
     const w = R.scores[0] === R.scores[1] ? -1 : (R.scores[0] > R.scores[1] ? 0 : 1);
-    R.players.forEach(p => send(p, { t: 'matchEnd', roundWinner: winner, winner: w, scores: R.scores, r: R.r, el: elArr(R) }));
+    R.players.forEach(p => send(p, { t: 'matchEnd', roundWinner: winner, winner: w, scores: R.scores, r: R.r, el: elArr(R), tie: !!R.tie }));
   } else {
-    R.players.forEach(p => send(p, { t: 'roundEnd', winner, scores: R.scores, r: R.r, el: elArr(R) }));
+    R.players.forEach(p => send(p, { t: 'roundEnd', winner, scores: R.scores, r: R.r, el: elArr(R), tie: !!R.tie }));
     R.timer = setTimeout(() => { R.r++; startRound(R); }, 3500);
   }
 }
@@ -108,7 +109,7 @@ function leave(c) {
   if (lobby.has(c) || (o && lobby.has(o))) setTimeout(broadcastLobby, 0);
 }
 function startRound(R) {
-  R.solvedThis = false; R.moves = [0, 0]; R.solves = [null, null]; R.goAt = Date.now() + GO_MS; clearTimeout(R.pendT); R.pendT = null;
+  R.solvedThis = false; R.tie = false; R.moves = [0, 0]; R.solves = [null, null]; R.goAt = Date.now() + GO_MS; clearTimeout(R.pendT); R.pendT = null;
   const limit = LIMITS[Math.max(0, Math.min(2, R.tier))];
   R.players.forEach(p => send(p, { t: 'round', r: R.r, total: R.rounds.length, level: R.rounds[R.r], scores: R.scores, limit, countdown: 3 }));
   clearTimeout(R.rtimer);
@@ -116,7 +117,7 @@ function startRound(R) {
   R.rtimer = setTimeout(() => { if (R.solvedThis || R.over) return; if (R.solves[0] || R.solves[1]) decideRound(R); else finishRound(R, -1); }, GO_MS + limit * 1000 + 2000);
 }
 function onMsg(c, m) {
-  if (m.t === 'ping') return send(c, { t: 'pong', c: m.c });
+  if (m.t === 'ping') { if (Number.isFinite(+m.r)) c.rtt = Math.max(0, Math.min(5000, +m.r)); return send(c, { t: 'pong', c: m.c }); }
   if (m.t === 'lobby') {
     leave(c);
     c.name = cleanName(m.name, c); c.id = c.id || nextId++; c.avail = !!m.avail; lobby.add(c);
@@ -181,7 +182,12 @@ function onMsg(c, m) {
     if (el > R.limitMs + 300) return;
     R.solves[c.idx] = { el, at: now };
     if (R.solves[0] && R.solves[1]) return decideRound(R);
-    if (!R.pendT) R.pendT = setTimeout(() => decideRound(R), GRACE_MS);
+    if (!R.pendT) {
+      // the other player can only still beat this time if their report is in flight: wait for the difference in one-way delay (+ margin)
+      const o = R.players[1 - c.idx];
+      const g = (o && Number.isFinite(o.rtt) && Number.isFinite(c.rtt)) ? Math.max(400, Math.min(2500, o.rtt / 2 - c.rtt / 2 + 400)) : GRACE_MS;
+      R.pendT = setTimeout(() => decideRound(R), g);
+    }
   }
 }
 server.listen(PORT, () => console.log('Wood Slide server listening on port ' + PORT));
